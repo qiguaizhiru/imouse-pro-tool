@@ -232,7 +232,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ICON_DIR = os.path.join(SCRIPT_DIR, "icon")
 
 # ─────────────────────────── 自动更新 ───────────────────────────
-CURRENT_VERSION = "2.0.1"
+CURRENT_VERSION = "2.0.2"
 UPDATE_REPO = "qiguaizhiru/imouse-pro-tool"
 UPDATE_BRANCH = "main"
 UPDATE_VERSION_URL = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}/version.txt"
@@ -297,6 +297,10 @@ class TransferApp:
         self.stop_publish = False    # 停止发布标记
         self.nurturing = False       # 是否正在养号中
         self.stop_nurture = False    # 停止养号标记
+        self.scheduled_timer = None  # 定时发布线程
+        self.scheduled_stop = False  # 取消定时发布标记
+        self.scheduled_target = None # 目标时间戳
+        self.scheduled_mode = None   # "all" 或 "selected"
 
         self._build_ui()
         self._auto_connect()
@@ -551,6 +555,51 @@ class TransferApp:
                        variable=self.save_drafts_var,
                        font=("Microsoft YaHei UI", 11),
                        bg=BG_SIDEBAR, fg="#E65100").pack(side=tk.LEFT)
+
+        # 定时发布
+        sched_frame = tk.LabelFrame(tab, text=" 定时发布 ", font=("Microsoft YaHei UI", 11),
+                                     bg=BG_SIDEBAR, padx=10, pady=5)
+        sched_frame.pack(fill=tk.X, pady=(0, 5))
+
+        sr1 = tk.Frame(sched_frame, bg=BG_SIDEBAR)
+        sr1.pack(fill=tk.X, pady=2)
+        tk.Label(sr1, text="定时时间:", font=("Microsoft YaHei UI", 11),
+                 bg=BG_SIDEBAR).pack(side=tk.LEFT)
+        self.entry_sched_time = tk.Entry(sr1, font=("Microsoft YaHei UI", 11), width=22)
+        # 默认值：当前时间 + 1 小时
+        _default_sched = time.strftime("%Y-%m-%d %H:%M:%S",
+                                        time.localtime(time.time() + 3600))
+        self.entry_sched_time.insert(0, _default_sched)
+        self.entry_sched_time.pack(side=tk.LEFT, padx=5)
+        tk.Label(sr1, text="格式: YYYY-MM-DD HH:MM:SS",
+                 font=("Microsoft YaHei UI", 10),
+                 bg=BG_SIDEBAR, fg="#999").pack(side=tk.LEFT, padx=5)
+
+        sr2 = tk.Frame(sched_frame, bg=BG_SIDEBAR)
+        sr2.pack(fill=tk.X, pady=2)
+        self.btn_sched_all = tk.Button(sr2, text="定时发布到所有在线设备",
+                                        font=("Microsoft YaHei UI", 11, "bold"),
+                                        command=lambda: self._schedule_publish("all"),
+                                        bg="#FF9800", fg="white", bd=0,
+                                        padx=12, pady=4)
+        self.btn_sched_all.pack(side=tk.LEFT)
+        self.btn_sched_selected = tk.Button(sr2, text="定时发布到选中设备",
+                                             font=("Microsoft YaHei UI", 11),
+                                             command=lambda: self._schedule_publish("selected"),
+                                             bg="#795548", fg="white", bd=0,
+                                             padx=10, pady=4)
+        self.btn_sched_selected.pack(side=tk.LEFT, padx=5)
+        self.btn_sched_cancel = tk.Button(sr2, text="取消定时",
+                                           font=("Microsoft YaHei UI", 11),
+                                           command=self._cancel_scheduled_publish,
+                                           bg="#757575", fg="white", bd=0,
+                                           padx=10, pady=4,
+                                           state=tk.DISABLED)
+        self.btn_sched_cancel.pack(side=tk.LEFT, padx=5)
+        self.lbl_sched_status = tk.Label(sr2, text="状态: 未设定",
+                                          font=("Microsoft YaHei UI", 10),
+                                          bg=BG_SIDEBAR, fg="#666")
+        self.lbl_sched_status.pack(side=tk.LEFT, padx=10)
 
         # 发布按钮区
         action_frame = tk.Frame(tab, bg=BG_SIDEBAR)
@@ -1020,6 +1069,124 @@ class TransferApp:
     def _stop_publishing(self):
         self.stop_publish = True
         self.log("正在停止发布...", "warn")
+
+    # ═══════════════════════════ 定时发布 ═══════════════════════════
+
+    def _schedule_publish(self, mode):
+        """设置定时发布。mode: 'all' 或 'selected'"""
+        if self.scheduled_timer is not None:
+            self.log("已有定时任务在等待，请先取消", "warn")
+            return
+        if not self.connected:
+            self.log("未连接内核", "warn")
+            return
+
+        # 解析时间
+        time_str = self.entry_sched_time.get().strip()
+        try:
+            target_ts = time.mktime(time.strptime(time_str, "%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            messagebox.showerror("时间格式错误",
+                "请使用格式: YYYY-MM-DD HH:MM:SS\n例如: 2026-04-19 10:30:00")
+            return
+
+        now = time.time()
+        if target_ts <= now:
+            messagebox.showerror("时间错误", "定时时间必须晚于当前时间")
+            return
+
+        # 校验素材
+        pub_file = self.entry_pub_file.get().strip()
+        pub_folder = self.entry_pub_folder.get().strip()
+        if not pub_file and not pub_folder and not self.publish_tasks:
+            messagebox.showwarning("提示", "请先选择素材文件、素材文件夹或导入Excel任务")
+            return
+
+        # 目标设备
+        if mode == "all":
+            devices = list(self.devices)
+            if not devices:
+                self.log("没有在线设备", "warn")
+                return
+        else:
+            devices = self._get_checked_devices()
+            if not devices:
+                messagebox.showwarning("提示", "请先勾选要发布的设备")
+                return
+
+        # 确认
+        delta = int(target_ts - now)
+        h, m, s = delta // 3600, (delta % 3600) // 60, delta % 60
+        msg = (f"定时发布时间: {time_str}\n"
+               f"距离现在: {h}小时{m}分{s}秒\n"
+               f"目标设备: {len(devices)} 台\n\n"
+               "到时间后自动开始发布流程。")
+        if not messagebox.askyesno("确认定时发布", msg, icon="info"):
+            return
+
+        # 启动定时线程
+        self.scheduled_target = target_ts
+        self.scheduled_mode = mode
+        self.scheduled_stop = False
+        self.btn_sched_all.config(state=tk.DISABLED)
+        self.btn_sched_selected.config(state=tk.DISABLED)
+        self.btn_sched_cancel.config(state=tk.NORMAL)
+        self.entry_sched_time.config(state=tk.DISABLED)
+
+        self.log(f"✓ 定时发布已设定: {time_str}（共 {len(devices)} 台设备）", "ok")
+        self.scheduled_timer = threading.Thread(
+            target=self._scheduled_watcher, args=(devices,), daemon=True)
+        self.scheduled_timer.start()
+
+    def _cancel_scheduled_publish(self):
+        """取消定时发布"""
+        if self.scheduled_timer is None:
+            return
+        self.scheduled_stop = True
+        self.log("定时发布已取消", "warn")
+        self._finish_scheduled()
+
+    def _finish_scheduled(self):
+        """清理定时状态"""
+        self.scheduled_timer = None
+        self.scheduled_target = None
+        self.scheduled_mode = None
+        try:
+            self.btn_sched_all.config(state=tk.NORMAL)
+            self.btn_sched_selected.config(state=tk.NORMAL)
+            self.btn_sched_cancel.config(state=tk.DISABLED)
+            self.entry_sched_time.config(state=tk.NORMAL)
+            self.lbl_sched_status.config(text="状态: 未设定")
+        except Exception:
+            pass
+
+    def _scheduled_watcher(self, devices):
+        """每秒检查是否到点，到点触发发布"""
+        while not self.scheduled_stop:
+            now = time.time()
+            remaining = int(self.scheduled_target - now)
+            if remaining <= 0:
+                break
+            # 更新倒计时显示
+            h, m, s = remaining // 3600, (remaining % 3600) // 60, remaining % 60
+            text = f"状态: 等待中 (还有 {h:02d}:{m:02d}:{s:02d})"
+            self.root.after(0, lambda t=text: self.lbl_sched_status.config(text=t))
+            time.sleep(1)
+
+        if self.scheduled_stop:
+            return
+
+        # 到点触发发布
+        self.root.after(0, lambda: self.log("⏰ 定时到达，开始发布...", "ok"))
+        self.root.after(0, lambda: self.lbl_sched_status.config(text="状态: 正在发布"))
+        # 清理定时状态（但不重置按钮，因为发布流程会接管）
+        self.scheduled_timer = None
+        self.scheduled_target = None
+        self.scheduled_mode = None
+        # 调用真正的发布流程
+        self.root.after(0, lambda: self._start_publish(devices))
+        # 发布结束后，UI 由 _finish_publish 接管，这里也要恢复定时按钮
+        self.root.after(0, self._finish_scheduled)
 
     def _publish_thread(self, devices):
         """发布主线程"""
@@ -2595,13 +2762,26 @@ class TransferApp:
                 return
             buf = io.BytesIO()
             total = 0
+            last_log = 0
             for chunk in resp.iter_content(chunk_size=64 * 1024):
                 if chunk:
                     buf.write(chunk)
                     total += len(chunk)
+                    if total - last_log >= 200 * 1024:
+                        last_log = total
+                        self.root.after(0, lambda s=total: self.log(
+                            f"  已下载 {s/1024:.1f} KB...", "info"))
             self.root.after(0, lambda s=total: self.log(
-                f"已下载 {s/1024:.1f} KB", "ok"))
+                f"下载完成，共 {s/1024:.1f} KB", "ok"))
 
+            buf.seek(0)
+            # 验证 zip 文件完整性
+            try:
+                _test = _zf.ZipFile(buf)
+                _test.testzip()
+            except _zf.BadZipFile:
+                self.root.after(0, lambda: self.log("更新包损坏或不是有效的zip", "err"))
+                return
             buf.seek(0)
             self.root.after(0, lambda: self.log("正在解压并替换文件...", "info"))
 
