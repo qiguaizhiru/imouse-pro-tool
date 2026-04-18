@@ -232,7 +232,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ICON_DIR = os.path.join(SCRIPT_DIR, "icon")
 
 # ─────────────────────────── 自动更新 ───────────────────────────
-CURRENT_VERSION = "2.0.2"
+CURRENT_VERSION = "2.0.3"
 UPDATE_REPO = "qiguaizhiru/imouse-pro-tool"
 UPDATE_BRANCH = "main"
 UPDATE_VERSION_URL = f"https://raw.githubusercontent.com/{UPDATE_REPO}/{UPDATE_BRANCH}/version.txt"
@@ -1058,13 +1058,30 @@ class TransferApp:
         if messagebox.askyesno("确认发布", msg, icon="warning"):
             self._start_publish(devs)
 
-    def _start_publish(self, devices):
+    def _capture_publish_snapshot(self):
+        """捕获当前UI上所有发布参数的快照"""
+        return {
+            "step_delay": float(self.entry_step_delay.get() or "3"),
+            "find_timeout": float(self.entry_find_timeout.get() or "15"),
+            "dev_delay": float(self.entry_dev_delay.get() or "2"),
+            "pub_file": self.entry_pub_file.get().strip(),
+            "pub_folder": self.entry_pub_folder.get().strip(),
+            "pub_url": self.entry_pub_url.get().strip(),
+            "pub_title": self.entry_pub_title.get().strip(),
+            "pub_desc": self.text_pub_desc.get("1.0", tk.END).strip(),
+            "pub_type": self.pub_type.get(),
+            "save_drafts": self.save_drafts_var.get(),
+            "publish_tasks": list(self.publish_tasks),  # 深拷贝列表
+        }
+
+    def _start_publish(self, devices, snapshot=None):
         self.publishing = True
         self.stop_publish = False
         self.btn_publish.config(state=tk.DISABLED)
         self.btn_publish_selected.config(state=tk.DISABLED)
         self.btn_stop_publish.config(state=tk.NORMAL)
-        threading.Thread(target=self._publish_thread, args=(devices,), daemon=True).start()
+        threading.Thread(target=self._publish_thread,
+                         args=(devices, snapshot), daemon=True).start()
 
     def _stop_publishing(self):
         self.stop_publish = True
@@ -1114,14 +1131,33 @@ class TransferApp:
                 messagebox.showwarning("提示", "请先勾选要发布的设备")
                 return
 
-        # 确认
+        # ★ 关键：此刻捕获UI快照，定时触发时用这些冻结的值，不再读UI
+        snapshot = self._capture_publish_snapshot()
+
+        # 确认（显示快照内容）
         delta = int(target_ts - now)
         h, m, s = delta // 3600, (delta % 3600) // 60, delta % 60
-        msg = (f"定时发布时间: {time_str}\n"
-               f"距离现在: {h}小时{m}分{s}秒\n"
-               f"目标设备: {len(devices)} 台\n\n"
-               "到时间后自动开始发布流程。")
-        if not messagebox.askyesno("确认定时发布", msg, icon="info"):
+        summary_lines = [
+            f"定时时间: {time_str}",
+            f"距离现在: {h}小时{m}分{s}秒",
+            f"目标设备: {len(devices)} 台",
+            f"内容类型: {'图片' if snapshot['pub_type']=='picture' else '视频'}",
+        ]
+        if snapshot["pub_folder"]:
+            summary_lines.append(f"素材文件夹: {os.path.basename(snapshot['pub_folder'])}")
+        elif snapshot["pub_file"]:
+            summary_lines.append(f"素材: {os.path.basename(snapshot['pub_file'])}")
+        if snapshot["pub_title"]:
+            summary_lines.append(f"标题: {snapshot['pub_title'][:30]}")
+        if snapshot["save_drafts"]:
+            summary_lines.append("模式: 存草稿")
+        if snapshot["publish_tasks"]:
+            summary_lines.append(f"Excel任务: {len(snapshot['publish_tasks'])} 条")
+        summary_lines.append("")
+        summary_lines.append("★ 所有参数将在此刻冻结")
+        summary_lines.append("★ 定时触发时即使您修改了输入框也不会影响")
+
+        if not messagebox.askyesno("确认定时发布", "\n".join(summary_lines), icon="info"):
             return
 
         # 启动定时线程
@@ -1133,9 +1169,9 @@ class TransferApp:
         self.btn_sched_cancel.config(state=tk.NORMAL)
         self.entry_sched_time.config(state=tk.DISABLED)
 
-        self.log(f"✓ 定时发布已设定: {time_str}（共 {len(devices)} 台设备）", "ok")
+        self.log(f"✓ 定时发布已设定: {time_str}（共 {len(devices)} 台设备，参数已冻结）", "ok")
         self.scheduled_timer = threading.Thread(
-            target=self._scheduled_watcher, args=(devices,), daemon=True)
+            target=self._scheduled_watcher, args=(devices, snapshot), daemon=True)
         self.scheduled_timer.start()
 
     def _cancel_scheduled_publish(self):
@@ -1160,8 +1196,8 @@ class TransferApp:
         except Exception:
             pass
 
-    def _scheduled_watcher(self, devices):
-        """每秒检查是否到点，到点触发发布"""
+    def _scheduled_watcher(self, devices, snapshot):
+        """每秒检查是否到点，到点用冻结的 snapshot 触发发布"""
         while not self.scheduled_stop:
             now = time.time()
             remaining = int(self.scheduled_target - now)
@@ -1176,34 +1212,36 @@ class TransferApp:
         if self.scheduled_stop:
             return
 
-        # 到点触发发布
-        self.root.after(0, lambda: self.log("⏰ 定时到达，开始发布...", "ok"))
+        # 到点触发发布（用冻结的 snapshot）
+        self.root.after(0, lambda: self.log("⏰ 定时到达，开始发布（使用冻结参数）...", "ok"))
         self.root.after(0, lambda: self.lbl_sched_status.config(text="状态: 正在发布"))
-        # 清理定时状态（但不重置按钮，因为发布流程会接管）
         self.scheduled_timer = None
         self.scheduled_target = None
         self.scheduled_mode = None
-        # 调用真正的发布流程
-        self.root.after(0, lambda: self._start_publish(devices))
-        # 发布结束后，UI 由 _finish_publish 接管，这里也要恢复定时按钮
+        self.root.after(0, lambda: self._start_publish(devices, snapshot=snapshot))
         self.root.after(0, self._finish_scheduled)
 
-    def _publish_thread(self, devices):
-        """发布主线程"""
-        step_delay = float(self.entry_step_delay.get() or "3")
-        find_timeout = float(self.entry_find_timeout.get() or "15")
-        dev_delay = float(self.entry_dev_delay.get() or "2")
+    def _publish_thread(self, devices, snapshot=None):
+        """发布主线程。snapshot 为 None 时实时读取UI；否则使用快照（定时发布）"""
+        if snapshot is None:
+            snapshot = self._capture_publish_snapshot()
 
-        pub_file = self.entry_pub_file.get().strip()
-        pub_folder = self.entry_pub_folder.get().strip()
-        pub_url = self.entry_pub_url.get().strip()
-        pub_title = self.entry_pub_title.get().strip()
-        pub_desc = self.text_pub_desc.get("1.0", tk.END).strip()
-        pub_type = self.pub_type.get()
+        step_delay = snapshot["step_delay"]
+        find_timeout = snapshot["find_timeout"]
+        dev_delay = snapshot["dev_delay"]
+
+        pub_file = snapshot["pub_file"]
+        pub_folder = snapshot["pub_folder"]
+        pub_url = snapshot["pub_url"]
+        pub_title = snapshot["pub_title"]
+        pub_desc = snapshot["pub_desc"]
+        pub_type = snapshot["pub_type"]
 
         # ═══ Excel 任务模式 ═══
-        if self.publish_tasks:
-            self._publish_excel_tasks(devices, step_delay, find_timeout, dev_delay)
+        if snapshot.get("publish_tasks"):
+            self._publish_excel_tasks(devices, step_delay, find_timeout, dev_delay,
+                                       excel_tasks=snapshot["publish_tasks"],
+                                       save_drafts=snapshot.get("save_drafts"))
             return
 
         # ═══ 普通模式 ═══
@@ -1254,7 +1292,8 @@ class TransferApp:
                     content_type=pub_type,
                     step_delay=step_delay,
                     find_timeout=find_timeout,
-                    task_index=idx + 1
+                    task_index=idx + 1,
+                    save_drafts=snapshot.get("save_drafts")
                 )
                 if ok:
                     success_count += 1
@@ -1869,10 +1908,13 @@ class TransferApp:
         self.root.after(0, lambda: self.btn_stop_nurture.config(state=tk.DISABLED))
         self.root.after(0, lambda: self._set_bottom("就绪"))
 
-    def _publish_excel_tasks(self, devices, step_delay, find_timeout, dev_delay):
-        """执行 Excel 导入的任务列表"""
-        tasks = list(self.publish_tasks)
+    def _publish_excel_tasks(self, devices, step_delay, find_timeout, dev_delay,
+                              excel_tasks=None, save_drafts=None):
+        """执行 Excel 导入的任务列表。excel_tasks=None时读取self.publish_tasks"""
+        tasks = list(excel_tasks if excel_tasks is not None else self.publish_tasks)
         total_tasks = len(tasks)
+        if save_drafts is None:
+            save_drafts = self.save_drafts_var.get()
 
         self.root.after(0, lambda: self.progress.config(maximum=total_tasks, value=0))
         self.root.after(0, lambda: self.log("=" * 50, "info"))
@@ -1941,7 +1983,8 @@ class TransferApp:
                         content_type=task_type,
                         step_delay=step_delay,
                         find_timeout=find_timeout,
-                        task_index=task_idx + 1
+                        task_index=task_idx + 1,
+                        save_drafts=save_drafts
                     )
                     if ok:
                         task_success += 1
@@ -2148,14 +2191,17 @@ class TransferApp:
     # ───────── 单台设备发布流程 ─────────
     def _publish_single_device(self, deviceid, dev_name, file_path="", music_url="",
                                 title="", description="", content_type="picture",
-                                step_delay=3, find_timeout=15, task_index=1):
+                                step_delay=3, find_timeout=15, task_index=1,
+                                save_drafts=None):
         """
         TikTok 发布流程 (专业版API):
         图片：HOME → TikTok → 音乐URL/+ → 相册入口 → 直接点第task_index张图 → Next → title → desc → Post/Drafts
         视频：HOME → TikTok → + → 相册入口 → 直接点第task_index张图 → Next → desc → Post/Drafts
         """
         api = self.pro_api
-        save_drafts = self.save_drafts_var.get()
+        # save_drafts 为 None 时实时读取；否则使用传入的快照值
+        if save_drafts is None:
+            save_drafts = self.save_drafts_var.get()
 
         def log(msg, tag="info"):
             self.root.after(0, lambda: self.log(f"  {msg}", tag))
